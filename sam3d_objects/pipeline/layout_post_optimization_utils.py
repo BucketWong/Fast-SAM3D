@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 import os
+from loguru import logger
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -380,10 +381,13 @@ def o3d_to_tensor(pcd):
     return torch.tensor(np.asarray(pcd.points), dtype=torch.float32)
 
 
-def run_ICP(source_points_mesh, source_points, target_points, threshold):
+def run_ICP(source_points_mesh, source_points, target_points, threshold,
+            visible_source_points=None):
     # Convert your point clouds
     mesh_src_pcd = tensor_to_o3d_pcd(source_points_mesh.verts_padded().squeeze(0))
-    src_pcd = tensor_to_o3d_pcd(source_points)
+    # Use visible source points for ICP matching if provided; otherwise all source points
+    icp_source = visible_source_points if visible_source_points is not None else source_points
+    src_pcd = tensor_to_o3d_pcd(icp_source)
     tgt_pcd = tensor_to_o3d_pcd(target_points)
 
     # Run ICP
@@ -403,7 +407,25 @@ def run_ICP(source_points_mesh, source_points, target_points, threshold):
     return points_aligned_icp, reg_p2p.transformation
 
 
-def run_render_compare(mesh, center, renderer, mask, device):
+def get_visible_vertices(mesh, renderer, mask=None):
+    """Get vertex indices visible from camera, optionally intersected with mask."""
+    fragments = renderer.rasterizer(mesh)
+    pix_to_face = fragments.pix_to_face[0, ..., 0]  # [H, W] top-layer face index
+
+    visible_pixels = pix_to_face >= 0  # [H, W]
+    if mask is not None:
+        mask_2d = mask[0, 0] > 0.5  # [1,1,H,W] -> [H,W]
+        visible_pixels = visible_pixels & mask_2d.to(visible_pixels.device)
+
+    visible_face_ids = pix_to_face[visible_pixels]
+    if visible_face_ids.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=mesh.device)
+
+    faces = mesh.faces_packed()  # [F, 3]
+    return torch.unique(faces[visible_face_ids])
+
+
+def run_render_compare(mesh, center, renderer, mask, device, optimize_scale=True):
 
     quat = torch.nn.Parameter(
         torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, requires_grad=True)
@@ -411,26 +433,53 @@ def run_render_compare(mesh, center, renderer, mask, device):
     translation = torch.nn.Parameter(
         torch.tensor([0.0, 0.0, 0.0], device=device, requires_grad=True)
     )
-    scale = torch.nn.Parameter(torch.tensor(1.0, device=device, requires_grad=True))
+    if optimize_scale:
+        scale = torch.nn.Parameter(torch.tensor(1.0, device=device, requires_grad=True))
+    else:
+        scale = torch.tensor(1.0, device=device)  # fixed, not optimized
 
     def get_optimizer(stage):
         if stage == 1:
-            return torch.optim.Adam([translation, scale], lr=1e-2)
+            params = [translation] + ([scale] if optimize_scale else [])
+            return torch.optim.Adam(params, lr=1e-2)
         elif stage == 2:
-            return torch.optim.Adam([quat, translation, scale], lr=5e-3)
+            params = [quat, translation] + ([scale] if optimize_scale else [])
+            return torch.optim.Adam(params, lr=5e-3)
 
     loss_weights = {"mask": 200, "reg_q": 0.1, "reg_t": 0.05, "reg_s": 0.05}
     prev_loss = None
 
+    # Track best IoU and corresponding weights
+    best_iou = -1.0
+    best_weights = {
+        "quat": quat.detach().clone(),
+        "translation": translation.detach().clone(),
+        "scale": scale.detach().clone(),
+    }
+
     global_step = 0
     for stage in [1, 2]:
         optimizer = get_optimizer(stage)
-        iters = [5, 25]
+        iters = [50, 200]
         for i in range(iters[stage - 1]):
             optimizer.zero_grad()
             transformed = apply_transform(mesh, center, quat, translation, scale)
             rendered = renderer(transformed)
             loss = compute_loss(rendered, mask, loss_weights, quat, translation, scale)
+
+            # Check IoU at current step and save if best
+            with torch.no_grad():
+                cur_iou = compute_iou(
+                    rendered[..., 3][0][None, None], mask, threshold=0.5
+                ).item()
+            if cur_iou > best_iou:
+                best_iou = cur_iou
+                best_weights = {
+                    "quat": quat.detach().clone(),
+                    "translation": translation.detach().clone(),
+                    "scale": scale.detach().clone(),
+                }
+
             loss.backward()
             optimizer.step()
             global_step += 1
@@ -438,8 +487,13 @@ def run_render_compare(mesh, center, renderer, mask, device):
                 break
             prev_loss = loss.item()
 
-    quat, translation, scale = quat.detach(), translation.detach(), scale.detach()
-    quat_normalized = quat / quat.norm()
+    # Use the weights from the best IoU step
+    quat_best = best_weights["quat"]
+    translation_best = best_weights["translation"]
+    scale_best = best_weights["scale"]
+    quat_normalized = quat_best / quat_best.norm()
     R = quaternion_to_matrix(quat_normalized)
 
-    return quat, translation, scale, R
+    logger.info(f"Render-compare: best IoU={best_iou:.4f} (selected from {global_step} steps)")
+
+    return quat_best, translation_best, scale_best, R

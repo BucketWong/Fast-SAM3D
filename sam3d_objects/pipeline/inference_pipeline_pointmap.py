@@ -210,6 +210,13 @@ class InferencePipelinePointMap(InferencePipeline):
             item["rgb_pointmap_scale"] = _item["rgb_pointmap_scale"][None].to(self.device)
             item["rgb_pointmap_shift"] = _item["rgb_pointmap_shift"][None].to(self.device)
 
+        # Add unnormed pointmap for post-optimization
+        if pointmap is not None and preprocessor.pointmap_transform != (None,):
+            full_pointmap = self._apply_transform(
+                pointmap, preprocessor.pointmap_transform
+            )
+            item["rgb_pointmap_unnorm"] = full_pointmap[None].to(self.device)
+
         return item
 
     def _clip_pointmap(self, pointmap: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -238,6 +245,17 @@ class InferencePipelinePointMap(InferencePipeline):
         pointmap_clipped = pointmap_clipped_flat.reshape(pointmap.shape)
         return pointmap_clipped 
 
+
+    def refine_scale(self, revised_scale):
+        if not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 1:2], atol=1e-3) or \
+           not torch.allclose(revised_scale[0, 0:1], revised_scale[0, 2:3], atol=1e-3):
+            logger.warning(
+                f"revised_scale values are not close (tolerance=1e-3): "
+            )
+        revised_scale = revised_scale.clone()
+        mean_val = revised_scale.mean(dim=1, keepdim=True)
+        revised_scale[:] = mean_val
+        return revised_scale
 
     def compute_pointmap(self, image, pointmap=None):
         loaded_image = self.image_to_float(image)
@@ -289,30 +307,300 @@ class InferencePipelinePointMap(InferencePipeline):
 
         return point_map_tensor
 
-    def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict):
+    @torch.autograd.grad_mode.inference_mode(mode=False)
+    def run_post_optimization(self, mesh_glb, intrinsics, pose_dict, layout_input_dict, fill_mask_holes=False, force_alignment=False, fixed_scale=None, Enable_visible_ICP=False, Enable_shape_ICP=True):
         intrinsics = intrinsics.clone()
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1] 
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         re_focal = min(fx, fy)
-        intrinsics[0, 0], intrinsics[1, 1] = re_focal, re_focal 
-        revised_quat, revised_t, revised_scale, final_iou, _, _ = (
-            self.layout_post_optimization_method(
-                mesh_glb, 
-                pose_dict["rotation"], 
-                pose_dict["translation"],
-                pose_dict["scale"],
-                layout_input_dict["rgb_image_mask"][0, 0],
-                layout_input_dict["rgb_pointmap"][0].permute(1, 2, 0),
-                intrinsics, 
-                min_size=518,
+        intrinsics[0, 0], intrinsics[1, 1] = re_focal, re_focal
+
+        # Convert pose_dict values to tensors if they are lists
+        rotation = pose_dict["rotation"]
+        translation = pose_dict["translation"]
+        scale = pose_dict["scale"]
+
+        if isinstance(rotation, list):
+            rotation = torch.tensor(rotation, dtype=torch.float32, device=self.device)
+            if rotation.dim() == 1:
+                rotation = rotation.unsqueeze(0).unsqueeze(0)
+            elif rotation.dim() == 2:
+                rotation = rotation.unsqueeze(0)
+
+        if isinstance(translation, list):
+            translation = torch.tensor(translation, dtype=torch.float32, device=self.device)
+            if translation.dim() == 1:
+                translation = translation.unsqueeze(0)
+
+        if isinstance(scale, list):
+            scale = torch.tensor(scale, dtype=torch.float32, device=self.device)
+            if scale.dim() == 1:
+                scale = scale.unsqueeze(0)
+
+        pose_dict = {
+            "rotation": rotation,
+            "translation": translation,
+            "scale": scale,
+        }
+
+        mask = layout_input_dict["rgb_image_mask"][0, 0]
+
+        if fill_mask_holes:
+            from scipy.ndimage import binary_fill_holes
+            mask_np = mask.cpu().numpy() > 0.5
+            mask_filled = binary_fill_holes(mask_np)
+            mask = torch.from_numpy(mask_filled.astype(np.float32)).to(mask.device)
+
+        if force_alignment:
+            revised_quat, revised_t, revised_scale, final_iou, _, _ = (
+                self._layout_post_optimization_force_alignment(
+                    mesh_glb,
+                    pose_dict["rotation"],
+                    pose_dict["translation"],
+                    pose_dict["scale"],
+                    mask,
+                    layout_input_dict["rgb_pointmap_unnorm"][0].permute(1, 2, 0),
+                    intrinsics,
+                    Enable_shape_ICP=Enable_shape_ICP,
+                    Enable_visible_ICP=Enable_visible_ICP,
+                    min_size=518,
+                    device=self.device,
+                    fixed_scale=fixed_scale,
+                )
             )
-        )
-    
+        else:
+            revised_quat, revised_t, revised_scale, final_iou, _, _ = (
+                self.layout_post_optimization_method(
+                    mesh_glb,
+                    pose_dict["rotation"],
+                    pose_dict["translation"],
+                    pose_dict["scale"],
+                    mask,
+                    layout_input_dict["rgb_pointmap_unnorm"][0].permute(1, 2, 0),
+                    intrinsics,
+                    Enable_shape_ICP=False,
+                    min_size=518,
+                    device=self.device,
+                )
+            )
+
+        revised_scale = self.refine_scale(revised_scale)
         return {
             "rotation": revised_quat,
             "translation": revised_t,
             "scale": revised_scale,
             "iou": final_iou,
         }
+
+    @torch.autograd.grad_mode.inference_mode(mode=False)
+    def _layout_post_optimization_force_alignment(
+        self,
+        Mesh,
+        quaternion,
+        translation,
+        scale,
+        mask,
+        point_map,
+        intrinsics,
+        Enable_shape_ICP=True,
+        Enable_visible_ICP=False,
+        Enable_rendering_optimization=True,
+        min_size=512,
+        device=None,
+        fixed_scale=None,
+    ):
+        from .layout_post_optimization_utils import (
+            get_mesh, get_mask_renderer, check_occlusion, run_alignment,
+            run_ICP, run_render_compare, apply_transform, compute_iou, set_seed,
+            get_visible_vertices
+        )
+        from pytorch3d.structures import Meshes
+        from pytorch3d.transforms import Transform3d, quaternion_to_matrix, matrix_to_quaternion
+        from .inference_utils import compose_transform
+
+        logger.info(f"Starting force_alignment post-optimization!")
+        set_seed(100)
+        if device is None:
+            device = quaternion.device
+
+        Rotation = quaternion_to_matrix(quaternion.squeeze(1))
+        center = translation[0].clone()
+        tfm_ori = compose_transform(scale=scale, rotation=Rotation, translation=translation)
+        mesh, faces_idx, textures = get_mesh(Mesh, tfm_ori, device)
+
+        mask, renderer = get_mask_renderer(mask, min_size, intrinsics, device)
+        logger.info(f"Loaded!")
+
+        source_points, target_points, center, tfm1, mesh, ori_iou, final_iou, flag_notgt = (
+            run_alignment(
+                point_map, mask, mesh, center, faces_idx, textures, renderer, device
+            )
+        )
+        logger.info(f"Step 1 (Manual Alignment) Done! ori_iou={ori_iou}, final_iou={final_iou}")
+
+        tfm_after_align = tfm_ori.compose(tfm1)
+        M_after_align = tfm_after_align.get_matrix()[0]
+        T_after_align = M_after_align[3, :3]
+        A_after_align = M_after_align[:3, :3]
+        scale_after_align = A_after_align.norm(dim=1)
+        R_after_align = A_after_align / scale_after_align[:, None]
+        quat_after_align = matrix_to_quaternion(R_after_align)
+        logger.info(f"[After Alignment] Translation: {T_after_align.tolist()}")
+        logger.info(f"[After Alignment] Rotation (quaternion): {quat_after_align.tolist()}")
+        logger.info(f"[After Alignment] Scale: {scale_after_align.tolist()}")
+
+        if flag_notgt:
+            logger.warning("No target points found, returning original pose")
+            return (quaternion, translation, scale, -1.0, False, False)
+
+        if Enable_shape_ICP:
+            Flag_ICP = True
+
+            visible_source_points = None
+            if Enable_visible_ICP:
+                vis_idx = get_visible_vertices(mesh, renderer, mask)
+                if vis_idx.numel() > 0:
+                    visible_source_points = mesh.verts_packed()[vis_idx]
+                    logger.info(f"Visible ICP: {vis_idx.numel()}/{mesh.verts_packed().shape[0]} vertices")
+                else:
+                    logger.warning("Visible ICP: no visible vertices, falling back to all")
+
+            points_aligned_icp, transformation = run_ICP(
+                mesh, source_points, target_points, threshold=0.05,
+                visible_source_points=visible_source_points
+            )
+            mesh_ICP = Meshes(
+                verts=[points_aligned_icp], faces=[faces_idx], textures=textures
+            )
+            rendered = renderer(mesh_ICP)
+            ori_iou_shapeICP = compute_iou(
+                rendered[..., 3][0][None, None], mask, threshold=0.5
+            )
+            if ori_iou_shapeICP > ori_iou:
+                mesh = mesh_ICP
+                final_iou = ori_iou_shapeICP.cpu().item()
+                T_o3d = torch.tensor(transformation, dtype=torch.float32, device=device)
+                T_o3d = T_o3d.T
+                A = T_o3d[:3, :3]
+                t = T_o3d[3, :3]
+                scale_icp = A.norm(dim=1)
+                R = A / scale_icp[:, None]
+                center = ((center[None] * scale_icp) @ R + t)[0]
+                tfm2 = (
+                    Transform3d(device=device)
+                    .scale(scale_icp[None])
+                    .rotate(R[None])
+                    .translate(t[None])
+                )
+                logger.info(f"Step 2 (ICP) accepted, iou improved to {final_iou}")
+            else:
+                Flag_ICP = False
+                scale_2, translation_2 = torch.tensor(1).to(device), torch.zeros([3]).to(device)
+                tfm2 = (
+                    Transform3d(device=device)
+                    .scale(scale_2.expand(3)[None])
+                    .translate(translation_2[None])
+                )
+                logger.info(f"Step 2 (ICP) rejected, keeping previous iou")
+        else:
+            Flag_ICP = False
+            scale_2, translation_2 = torch.tensor(1).to(device), torch.zeros([3]).to(device)
+            tfm2 = (
+                Transform3d(device=device)
+                .scale(scale_2.expand(3)[None])
+                .translate(translation_2[None])
+            )
+        logger.info(f"Step 2 Done!")
+
+        tfm_after_icp = tfm_ori.compose(tfm1).compose(tfm2)
+        M_after_icp = tfm_after_icp.get_matrix()[0]
+        T_after_icp = M_after_icp[3, :3]
+        A_after_icp = M_after_icp[:3, :3]
+        scale_after_icp = A_after_icp.norm(dim=1)
+        R_after_icp = A_after_icp / scale_after_icp[:, None]
+        quat_after_icp = matrix_to_quaternion(R_after_icp)
+        if Enable_shape_ICP:
+            logger.info(f"[After ICP] Translation: {T_after_icp.tolist()}")
+            logger.info(f"[After ICP] Rotation (quaternion): {quat_after_icp.tolist()}")
+            logger.info(f"[After ICP] Scale: {scale_after_icp.tolist()}")
+        else:
+            logger.info("ICP was disabled")
+
+        if fixed_scale is not None:
+            fs = fixed_scale.detach().squeeze().to(device)
+            ratio = fs / scale_after_icp
+            verts = mesh.verts_packed()
+            mesh = Meshes(
+                verts=[(verts - T_after_icp[None]) * ratio[None] + T_after_icp[None]],
+                faces=[faces_idx], textures=textures,
+            )
+            center = (center - T_after_icp) * ratio + T_after_icp
+            logger.info(f"[Scale fix before step 3] {scale_after_icp.tolist()} -> {fs.tolist()}")
+
+        if not Enable_rendering_optimization:
+            Flag_optim = False
+            tfm = tfm_ori.compose(tfm1).compose(tfm2)
+        else:
+            quat, translation_opt, scale_opt, R = run_render_compare(
+                mesh, center, renderer, mask, device,
+                optimize_scale=(fixed_scale is None),
+            )
+            with torch.no_grad():
+                transformed = apply_transform(mesh, center, quat, translation_opt, scale_opt)
+                rendered = renderer(transformed)
+            optimized_iou = compute_iou(
+                rendered[..., 3][0][None, None], mask, threshold=0.5
+            )
+            iou_before_rc = final_iou
+            logger.info(f"Step 3 (Render-Compare) iou={optimized_iou.item():.4f}, iou_before_rc={iou_before_rc:.4f}, ori_iou={ori_iou}")
+
+            if optimized_iou.item() >= iou_before_rc:
+                Flag_optim = True
+                final_iou = optimized_iou.detach().cpu().item()
+                tfm3 = (
+                    Transform3d(device=device)
+                    .translate(-center[None])
+                    .scale(scale_opt.expand(3)[None])
+                    .rotate(R.T[None])
+                    .translate(center[None])
+                    .translate(translation_opt[None])
+                )
+                tfm = tfm_ori.compose(tfm1).compose(tfm2).compose(tfm3)
+                logger.info(f"Render-compare accepted, iou improved {iou_before_rc:.4f} -> {final_iou:.4f}")
+            else:
+                Flag_optim = False
+                tfm = tfm_ori.compose(tfm1).compose(tfm2)
+                logger.info(f"Render-compare rejected, iou would decrease {iou_before_rc:.4f} -> {optimized_iou.item():.4f}. Keeping pre-RC pose.")
+
+            M_after_rc = tfm.get_matrix()[0]
+            T_after_rc = M_after_rc[3, :3]
+            A_after_rc = M_after_rc[:3, :3]
+            scale_after_rc = A_after_rc.norm(dim=1)
+            R_after_rc = A_after_rc / scale_after_rc[:, None]
+            quat_after_rc = matrix_to_quaternion(R_after_rc)
+            logger.info(f"[After Render-Compare] Translation: {T_after_rc.tolist()}")
+            logger.info(f"[After Render-Compare] Rotation (quaternion): {quat_after_rc.tolist()}")
+            logger.info(f"[After Render-Compare] Scale: {scale_after_rc.tolist()}")
+
+        logger.info(f"Step 3 Done!")
+        M = tfm.get_matrix()[0]
+        T_final = M[3, :3][None]
+        A = M[:3, :3]
+        scale_final = A.norm(dim=1)[None]
+        R_final = A / scale_final[:, None]
+        quat_final = matrix_to_quaternion(R_final)
+
+        logger.info(f"[Final] Translation: {T_final.tolist()}")
+        logger.info(f"[Final] Rotation (quaternion): {quat_final.tolist()}")
+        logger.info(f"[Final] Scale: {scale_final.tolist()}")
+
+        return (
+            quat_final,
+            T_final,
+            scale_final,
+            round(float(final_iou), 4),
+            Flag_ICP,
+            Flag_optim,
+        )
 
 
     def run(
