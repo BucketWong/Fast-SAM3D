@@ -16,7 +16,7 @@ representation_config:
     _rotation: 0.1
   perturb_offset: true
   voxel_size: 1.5
-  num_gaussians: 4 
+  num_gaussians: 4
   2d_filter_kernel_size: 0.1
   3d_filter_kernel_size: 0.0009
   scaling_bias: 0.004

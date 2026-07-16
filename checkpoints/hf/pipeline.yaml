@@ -18,7 +18,7 @@ slat_cfg_strength: 1
 slat_rescale_t: 1
 downsample_ss_dist: 1
 compile_model: true
-ss_condition_input_mapping: [] 
+ss_condition_input_mapping: []
 ss_preprocessor:
   _target_: sam3d_objects.data.dataset.tdfy.preprocessor.PreProcessor
   img_mask_joint_transform: []
@@ -62,7 +62,7 @@ depth_model:
   _target_: sam3d_objects.pipeline.depth_models.moge.MoGe
   model:
     _target_: moge.model.v1.MoGeModel.from_pretrained
-    pretrained_model_name_or_path: Ruicheng/moge-vitl # auto-downloads model.pt from HF (was a hardcoded local path)
+    pretrained_model_name_or_path: Ruicheng/moge-vitl
 slat_condition_input_mapping: []
 slat_preprocessor:
   _target_: sam3d_objects.data.dataset.tdfy.preprocessor.PreProcessor

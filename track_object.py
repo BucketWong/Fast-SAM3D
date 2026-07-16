@@ -2,6 +2,8 @@
 
 Fast-SAM3D **batched** variant:
   - Batched sampling: all K pose samples processed in parallel (chunked)
+  - Temporal shape chaining: the selected previous-frame shape guides the next frame
+  - Per-frame dynamic OBJ export through SLaT and the mesh decoder
   - Taylor expansion cache (ShortCut_faster): ~2.7x per-sample speedup
   - Optional torch.compile on DiT backbone
   - All Fast-SAM3D acceleration flags (SS cache, SLaT carving, mesh aggregation)
@@ -430,7 +432,7 @@ def get_frame_mask_dir(masks_root, frame_idx):
 
 def discover_frames(vid_dir, object_name, frame_range=None, masks_root=None, frames_dir=None):
     if frames_dir is None:
-        frames_dir = os.path.join(vid_dir, "all_frames")
+        frames_dir = os.path.join(vid_dir, "raw_frames")
     if masks_root is None:
         masks_root = os.path.join(vid_dir, "video_segmentation", "masks")
 
@@ -1167,6 +1169,11 @@ def guided_predict_pose(
             "intrinsics": intrinsics,
             "sample_seed": sample_seed,
             "x1_latent": x1_latent,
+            # Kept only until the winning candidate is selected. The caller
+            # uses these coordinates to build the next frame's shape-IoU
+            # reference; they are removed before results are serialized.
+            "_shape_coords": guided_return_dict["coords_original"].detach().cpu(),
+            "_mesh_coords": guided_return_dict["coords"].detach().cpu(),
         }
 
         # Compute render IoU if requested
@@ -1247,6 +1254,17 @@ def guided_predict_pose(
             )
         best_result["all_samples"] = all_samples
 
+    # Preserve the selected decoded sparse structure for temporal shape
+    # chaining, but do not retain one coordinate set per candidate.
+    # x1_latent["shape"] is the corresponding continuous latent target.
+    best_shape_coords = best_result.get("_shape_coords")
+    best_mesh_coords = best_result.get("_mesh_coords")
+    for sample in all_samples:
+        sample.pop("_shape_coords", None)
+        sample.pop("_mesh_coords", None)
+    best_result["_next_shape_coords"] = best_shape_coords
+    best_result["_selected_mesh_coords"] = best_mesh_coords
+
     # Run post-optimization on the best sample only
     if post_optimize and init_trimesh is not None:
         try:
@@ -1282,6 +1300,69 @@ def guided_predict_pose(
                 best_result["post_opt_scale"] = fixed_cpu.clone()
 
     return best_result
+
+
+# ------------------------------------------------------------------
+# Per-frame dynamic mesh export
+# ------------------------------------------------------------------
+
+@torch.no_grad()
+def generate_and_export_frame_mesh(
+    pipeline,
+    rgba,
+    coords,
+    output_path,
+    seed=42,
+    inference_steps=None,
+):
+    """Generate a local-space mesh from a selected sparse structure."""
+    if coords is None or coords.shape[0] == 0:
+        raise ValueError("Cannot generate a mesh from an empty sparse structure")
+
+    slat_input_dict = pipeline.preprocess_image(rgba, pipeline.slat_preprocessor)
+    device = slat_input_dict["image"].device
+    coords = coords.to(device=device, dtype=torch.int32)
+
+    # The accelerated SLaT generator expects [score, x, y, z] spatial
+    # metadata. A uniform score keeps carving neutral while retaining the
+    # selected coordinates.
+    coords_scores = torch.cat(
+        [
+            torch.ones((coords.shape[0], 1), device=device, dtype=torch.float32),
+            coords[:, 1:].float(),
+        ],
+        dim=1,
+    )
+
+    torch.manual_seed(seed)
+    slat = pipeline.sample_slat(
+        slat_input_dict,
+        coords,
+        inference_steps=inference_steps,
+        map_tokens=None,
+        coords_scores=coords_scores,
+    )
+
+    mesh_decoder = pipeline.models["slat_decoder_mesh"]
+    if hasattr(mesh_decoder, "map"):
+        mesh_decoder.map = None
+    with torch.autocast(device_type="cuda", dtype=pipeline.dtype):
+        mesh_result = mesh_decoder(slat)[0]
+
+    if not getattr(mesh_result, "success", True):
+        raise RuntimeError("SLaT mesh decoder returned an empty mesh")
+
+    vertices = mesh_result.vertices.detach().float().cpu().numpy()
+    faces = mesh_result.faces.detach().long().cpu().numpy()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    mesh.export(output_path)
+    return {
+        "path": output_path,
+        "num_vertices": int(vertices.shape[0]),
+        "num_faces": int(faces.shape[0]),
+    }
 
 
 # ------------------------------------------------------------------
@@ -1416,6 +1497,20 @@ def save_combined_visualization(
             continue
 
         obj_name = f"{object_name}_frame{frame_idx}"
+        obj_filename = f"{obj_name}.obj"
+
+        dynamic_mesh_rel = result.get("dynamic_mesh_path")
+        dynamic_mesh_src = (
+            os.path.join(output_dir, dynamic_mesh_rel)
+            if dynamic_mesh_rel is not None
+            else mesh_path
+        )
+        if os.path.isfile(dynamic_mesh_src):
+            shutil.copy(dynamic_mesh_src, os.path.join(combined_dir, obj_filename))
+        else:
+            logger.warning(
+                f"  Frame {frame_idx}: mesh not found at {dynamic_mesh_src}"
+            )
 
         best_dict = _build_pose_dict(_get_best_pose(result), init_trimesh)
         diff_dict = _build_pose_dict(_get_diffusion_pose(result), init_trimesh)
@@ -1424,7 +1519,7 @@ def save_combined_visualization(
             "index": idx,
             "frame_idx": frame_idx,
             "camera_frame": f"cam{frame_idx}",
-            "mesh_obj": f"{obj_name}.obj",
+            "mesh_obj": obj_filename,
             "local_to_scene": best_dict,
             "diffusion_pose": diff_dict,
         }
@@ -1631,10 +1726,20 @@ def process_video(args):
     )
     z_target_flat = z_target_5d.view(1, 8, -1).permute(0, 2, 1).contiguous()
     logger.info(f"z_target ready ({encode_method}), shape: {z_target_flat.shape}")
+    if args.chain_shapes:
+        logger.info(
+            "Shape chaining enabled: each selected frame shape becomes the "
+            "latent and occupancy reference for the adjacent frame"
+        )
 
     init_trimesh = (
         trimesh.load(mesh_path, force="mesh")
-        if (args.post_optimize or args.save_layout or args.scoring_metric == "render_iou")
+        if (
+            args.post_optimize
+            or args.save_layout
+            or args.save_frame_meshes
+            or args.scoring_metric == "render_iou"
+        )
         else None
     )
 
@@ -1692,6 +1797,17 @@ def process_video(args):
                            "setting pose_guidance_strength to 0.5")
             args.pose_guidance_strength = 0.5
 
+    if args.chain_shapes and args.post_optimize and args.enable_shape_icp:
+        logger.warning(
+            "Shape chaining is enabled while shape ICP still uses the init-frame "
+            "mesh. For strongly deformable objects, consider --no-enable_shape_icp."
+        )
+    if args.chain_shapes and args.scoring_metric == "render_iou":
+        logger.warning(
+            "render_iou renders the init-frame mesh, not the chained sparse shape. "
+            "For deformation-aware candidate selection, use --scoring_metric shape_iou."
+        )
+
     render_mesh = None
     image_hw = None
     if args.scoring_metric == "render_iou":
@@ -1715,10 +1831,29 @@ def process_video(args):
                 f"Forward: {len(forward_indices)} frames ({forward_indices[:3]}{'...' if len(forward_indices) > 3 else ''})")
 
     os.makedirs(args.output_dir, exist_ok=True)
+    frame_mesh_dir = os.path.join(args.output_dir, "frame_meshes")
+    if args.save_frame_meshes:
+        os.makedirs(frame_mesh_dir, exist_ok=True)
+        init_mesh_output_path = os.path.join(
+            frame_mesh_dir, f"frame_{init_frame:06d}.obj",
+        )
+        init_trimesh.export(init_mesh_output_path)
+        init_frame_result["dynamic_mesh_path"] = os.path.relpath(
+            init_mesh_output_path, args.output_dir,
+        )
+        init_frame_result["dynamic_mesh_num_vertices"] = int(
+            len(init_trimesh.vertices)
+        )
+        init_frame_result["dynamic_mesh_num_faces"] = int(
+            len(init_trimesh.faces)
+        )
+        logger.info(f"Saved init-frame mesh to {init_mesh_output_path}")
     all_results = {}
     processed_count = [0]
 
-    def _process_single_frame(frame_idx, pose_target, pass_name):
+    def _process_single_frame(
+        frame_idx, pose_target, shape_target_flat, shape_target_ss, pass_name,
+    ):
         processed_count[0] += 1
         fidx, image_path, mask_path = frame_lookup[frame_idx]
 
@@ -1731,8 +1866,10 @@ def process_video(args):
         mask = load_mask(mask_path)
 
         if mask.sum() == 0:
-            logger.warning(f"  Frame {frame_idx}: empty mask -- skipping, reusing previous pose target")
-            return None
+            logger.warning(
+                f"  Frame {frame_idx}: empty mask -- skipping, reusing previous pose and shape targets"
+            )
+            return None, None, None
 
         rgba = np.concatenate(
             [image[..., :3], (mask.astype(np.uint8) * 255)[..., None]], axis=-1
@@ -1761,7 +1898,7 @@ def process_video(args):
             frame_pose_strength = args.pose_guidance_strength
 
         result = guided_predict_pose(
-            pipeline, mesh_ss, rgba, z_target_flat, device,
+            pipeline, shape_target_ss, rgba, shape_target_flat, device,
             guidance_strength=args.guidance_strength,
             pose_guidance_strength=frame_pose_strength,
             pose_target=pose_target,
@@ -1789,6 +1926,62 @@ def process_video(args):
 
         torch.cuda.synchronize()
         result["frame_time_s"] = time.perf_counter() - _t0
+
+        # Capture the winning diffusion shape before stripping large/internal
+        # tensors from the persisted per-frame result. This state is passed
+        # only to the adjacent frame in the current traversal direction.
+        next_shape_target_flat = None
+        next_shape_target_ss = None
+        next_shape_coords = result.pop("_next_shape_coords", None)
+        selected_mesh_coords = result.pop("_selected_mesh_coords", None)
+        if args.chain_shapes:
+            x1_shape = result.get("x1_latent", {}).get("shape")
+            if x1_shape is not None and next_shape_coords is not None:
+                next_shape_target_flat = x1_shape.detach().cpu().clone()
+                next_shape_target_ss = torch.zeros_like(
+                    shape_target_ss, device="cpu",
+                )
+                coords = next_shape_coords.long()
+                if coords.numel() > 0:
+                    next_shape_target_ss[
+                        coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+                    ] = 1
+            else:
+                logger.warning(
+                    f"  Frame {frame_idx}: selected shape state unavailable; "
+                    "keeping the previous shape reference"
+                )
+
+        if args.save_frame_meshes:
+            frame_mesh_path = os.path.join(
+                frame_mesh_dir, f"frame_{frame_idx:06d}.obj",
+            )
+            mesh_t0 = time.perf_counter()
+            try:
+                mesh_info = generate_and_export_frame_mesh(
+                    pipeline,
+                    rgba,
+                    selected_mesh_coords,
+                    frame_mesh_path,
+                    seed=args.seed,
+                    inference_steps=args.frame_mesh_slat_steps,
+                )
+                result["dynamic_mesh_path"] = os.path.relpath(
+                    mesh_info["path"], args.output_dir,
+                )
+                result["dynamic_mesh_num_vertices"] = mesh_info["num_vertices"]
+                result["dynamic_mesh_num_faces"] = mesh_info["num_faces"]
+                logger.info(
+                    f"  mesh: {mesh_info['num_vertices']} vertices, "
+                    f"{mesh_info['num_faces']} faces -> {frame_mesh_path}"
+                )
+            except Exception as e:
+                result["dynamic_mesh_error"] = str(e)
+                logger.warning(f"  Frame {frame_idx}: mesh export failed: {e}")
+            finally:
+                result["mesh_time_s"] = time.perf_counter() - mesh_t0
+                torch.cuda.empty_cache()
+        result["total_frame_time_s"] = time.perf_counter() - _t0
         result.pop("x1_latent", None)  # strip large latent before saving
 
         # Save all K samples to a separate file
@@ -1823,7 +2016,7 @@ def process_video(args):
 
         all_results[frame_idx] = result
 
-        return result
+        return result, next_shape_target_flat, next_shape_target_ss
 
     # ---- Backward pass: K-1 -> 0 ----
     if backward_indices:
@@ -1832,6 +2025,8 @@ def process_video(args):
         logger.info(f"{'='*60}")
         bwd_pose_target = _get_best_pose(init_frame_result) if args.chain_poses else pose_target_from_file
         bwd_pose_frame = init_frame
+        bwd_shape_target_flat = z_target_flat
+        bwd_shape_target_ss = mesh_ss
 
         for frame_idx in backward_indices:
             if args.chain_poses:
@@ -1845,9 +2040,18 @@ def process_video(args):
             else:
                 bwd_pose_target_in_curr = bwd_pose_target
 
-            result = _process_single_frame(frame_idx, bwd_pose_target_in_curr, "backward")
+            result, next_shape_flat, next_shape_ss = _process_single_frame(
+                frame_idx,
+                bwd_pose_target_in_curr,
+                bwd_shape_target_flat,
+                bwd_shape_target_ss,
+                "backward",
+            )
             if result is None:
                 continue
+            if args.chain_shapes and next_shape_flat is not None:
+                bwd_shape_target_flat = next_shape_flat
+                bwd_shape_target_ss = next_shape_ss
             if args.chain_poses:
                 if args.chain_on_diffusion:
                     bwd_pose_target = _get_diffusion_pose(result)
@@ -1862,6 +2066,8 @@ def process_video(args):
         logger.info(f"{'='*60}")
         fwd_pose_target = _get_best_pose(init_frame_result) if args.chain_poses else pose_target_from_file
         fwd_pose_frame = init_frame
+        fwd_shape_target_flat = z_target_flat
+        fwd_shape_target_ss = mesh_ss
 
         for frame_idx in forward_indices:
             if args.chain_poses:
@@ -1875,9 +2081,18 @@ def process_video(args):
             else:
                 fwd_pose_target_in_curr = fwd_pose_target
 
-            result = _process_single_frame(frame_idx, fwd_pose_target_in_curr, "forward")
+            result, next_shape_flat, next_shape_ss = _process_single_frame(
+                frame_idx,
+                fwd_pose_target_in_curr,
+                fwd_shape_target_flat,
+                fwd_shape_target_ss,
+                "forward",
+            )
             if result is None:
                 continue
+            if args.chain_shapes and next_shape_flat is not None:
+                fwd_shape_target_flat = next_shape_flat
+                fwd_shape_target_ss = next_shape_ss
             if args.chain_poses:
                 if args.chain_on_diffusion:
                     fwd_pose_target = _get_diffusion_pose(result)
@@ -1897,6 +2112,13 @@ def process_video(args):
         "guidance_strength": args.guidance_strength,
         "pose_guidance_strength": args.pose_guidance_strength,
         "pose_sde_strength": args.pose_sde_strength,
+        "chain_shapes": args.chain_shapes,
+        "shape_reference": (
+            "previous_selected_frame" if args.chain_shapes else "init_frame"
+        ),
+        "save_frame_meshes": args.save_frame_meshes,
+        "frame_mesh_dir": "frame_meshes" if args.save_frame_meshes else None,
+        "frame_mesh_slat_steps": args.frame_mesh_slat_steps,
         "num_pose_samples": args.num_pose_samples,
         "scoring_metric": args.scoring_metric,
         "pose_selection": args.pose_selection,
@@ -1963,6 +2185,30 @@ def main():
                         help=argparse.SUPPRESS)
     parser.add_argument("--chain_poses", action="store_true",
                         help="Chain previous frame's pose as target for next frame")
+    parser.add_argument(
+        "--chain_shapes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Chain each selected frame's diffusion shape as the adjacent frame's "
+            "shape guidance and shape-IoU reference (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--save_frame_meshes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Decode and save the selected dynamic shape for every processed "
+            "frame as frame_meshes/frame_XXXXXX.obj (default: enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--frame_mesh_slat_steps",
+        type=int,
+        default=None,
+        help="Override SLaT inference steps used for per-frame mesh generation",
+    )
     parser.add_argument("--chain_on_diffusion", action="store_true", default=False,
                         help="When chaining, use raw diffusion pose instead of post-optimized")
     parser.add_argument("--pose_sde_strength", type=float, default=0.0,

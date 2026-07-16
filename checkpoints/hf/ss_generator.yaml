@@ -1,4 +1,3 @@
-
 module:
   condition_embedder:
     backbone:
@@ -9,25 +8,22 @@ module:
         - 1.0
       dropout_prob: 0.1
       embedder_list:
-
       - - _target_: sam3d_objects.model.backbone.dit.embedder.dino.Dino
           dino_model: dinov2_vitl14_reg
           input_size: 518
           normalize_images: true
         - - - image
-            - cropped   
+            - cropped
           - - rgb_image
-            - full      
-
+            - full
       - - _target_: sam3d_objects.model.backbone.dit.embedder.dino.Dino
           dino_model: dinov2_vitl14_reg
           input_size: 518
           normalize_images: true
         - - - mask
-            - cropped   
+            - cropped
           - - rgb_image_mask
-            - full      
- 
+            - full
       - - _target_: sam3d_objects.model.backbone.dit.embedder.pointmap.PointPatchEmbed
           embed_dim: 512
           input_size: 256
@@ -39,7 +35,7 @@ module:
             - full
       force_drop_modalities: null
       freeze: true
-      projection_net_hidden_dim_multiplier: 4.0 
+      projection_net_hidden_dim_multiplier: 4.0
       use_pos_embedding: learned
   generator:
     backbone:
@@ -47,8 +43,7 @@ module:
       batch_mode: true
       cfg_modalities:
       - shape
-      inference_steps: 2  
-  
+      inference_steps: 2
       loss_weights:
         6drotation_normalized: 0.1
         _target_: sam3d_objects.config.utils.make_dict
@@ -61,7 +56,6 @@ module:
       reverse_fn:
         _target_: sam3d_objects.model.backbone.generator.classifier_free_guidance.ClassifierFreeGuidanceWithExternalUnconditionalProbability
         backbone:
- 
           _target_: sam3d_objects.model.backbone.tdfy_dit.models.mot_sparse_structure_flow.SparseStructureFlowTdfyWrapper
           cond_channels: 1024
           condition_embedder: null
@@ -71,7 +65,6 @@ module:
           in_channels: 8
           is_shortcut_model: true
           latent_mapping:
-    
             6drotation_normalized:
               _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
               in_channels: 6
@@ -80,7 +73,6 @@ module:
                 _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
                 model_channels: 1024
                 token_len: 1
-           
             scale:
               _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
               in_channels: 3
@@ -89,7 +81,6 @@ module:
                 _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
                 model_channels: 1024
                 token_len: 1
-           
             shape:
               _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
               in_channels: 8
@@ -99,7 +90,6 @@ module:
                 model_channels: 1024
                 patch_size: 1
                 resolution: 16
-           
             translation:
               _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
               in_channels: 3
@@ -108,7 +98,6 @@ module:
                 _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.LearntPositionEmbedder
                 model_channels: 1024
                 token_len: 1
-          
             translation_scale:
               _target_: sam3d_objects.model.backbone.tdfy_dit.models.mm_latent.Latent
               in_channels: 1
