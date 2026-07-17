@@ -1346,8 +1346,8 @@ def generate_and_export_frame_mesh(
     mesh_decoder = pipeline.models["slat_decoder_mesh"]
     if hasattr(mesh_decoder, "map"):
         mesh_decoder.map = None
-    with torch.autocast(device_type="cuda", dtype=pipeline.dtype):
-        mesh_result = mesh_decoder(slat)[0]
+
+    mesh_result = mesh_decoder(slat)[0]
 
     if not getattr(mesh_result, "success", True):
         raise RuntimeError("SLaT mesh decoder returned an empty mesh")
